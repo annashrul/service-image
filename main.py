@@ -54,15 +54,17 @@ MAX_IMAGE_BYTES = int(float(os.getenv("IMAGE_MAX_SIZE_MB", "5")) * 1024 * 1024)
 # menyimpannya di products."embeddingModel" dan menganggap baris dengan tag
 # berbeda sebagai stale → otomatis di-embed ulang oleh sweeper/backfill.
 #
-# tp2 = trim border → pad ke persegi → 2 view TTA (full + center-crop 0.85),
-#       rata-rata lalu L2-normalize ulang.
+# tp3 = trim border → pad ke persegi → 3 view TTA (full + 0.85 + 0.68),
+#       weighted average lalu L2-normalize ulang.
 # NAIKKAN TAG INI setiap kali langkah/parameter di bawah berubah.
-PREPROCESS_TAG = "tp2"
+PREPROCESS_TAG = "tp3"
 MODEL_TAG = f"{MODEL_NAME}+{PREPROCESS_TAG}"
 # Toleransi selisih warna (0..255) saat mendeteksi border seragam.
 TRIM_TOL = 12
 # Fraksi center-crop untuk view TTA kedua.
 TTA_CROP = 0.85
+# Fraksi crop fokus objek untuk view TTA ketiga.
+TTA_TIGHT_CROP = 0.68
 
 app = FastAPI(title="MiniPOS Embedding Service", version="1.0.0")
 
@@ -157,16 +159,20 @@ def _center_crop(img: Image.Image, frac: float) -> Image.Image:
 
 
 def _views(img: Image.Image) -> List[Image.Image]:
-    """View TTA untuk satu gambar: full + center-crop. Lihat PREPROCESS_TAG."""
+    """View TTA: full, crop sedang, dan crop fokus objek."""
     trimmed = _trim_border(img)
-    return [_pad_square(trimmed), _pad_square(_center_crop(trimmed, TTA_CROP))]
+    return [
+        _pad_square(trimmed),
+        _pad_square(_center_crop(trimmed, TTA_CROP)),
+        _pad_square(_center_crop(trimmed, TTA_TIGHT_CROP)),
+    ]
 
 
 # ─── Encoder ─────────────────────────────────────────────────────────
 def _encode(images: List[Image.Image]) -> np.ndarray:
     """Jalankan image encoder → matriks (n, dim) yang sudah L2-normalized."""
     inputs = _processor(images=images, return_tensors="pt")
-    with torch.no_grad():
+    with torch.inference_mode():
         feats = _model.get_image_features(**inputs)
     arr = feats.detach().cpu().numpy().astype("float32")
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
@@ -184,16 +190,21 @@ def _embed_images(images: List[Image.Image]) -> np.ndarray:
     supaya puncak memori tidak naik walau tiap gambar jadi beberapa view.
     """
     views: List[Image.Image] = []
+    weights: List[float] = []
     spans: List[tuple[int, int]] = []
     for img in images:
         v = _views(img)
         spans.append((len(views), len(views) + len(v)))
         views.extend(v)
+        weights.extend((0.5, 0.3, 0.2))
 
     chunks = [_encode(views[i : i + MAX_BATCH]) for i in range(0, len(views), MAX_BATCH)]
     encoded = np.vstack(chunks)
 
-    merged = np.stack([encoded[a:b].mean(axis=0) for a, b in spans])
+    merged = np.stack([
+        (encoded[a:b] * np.asarray(weights[a:b], dtype=np.float32)[:, None]).sum(axis=0)
+        for a, b in spans
+    ])
     norms = np.linalg.norm(merged, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     return merged / norms
@@ -207,7 +218,7 @@ def _embed_texts(texts: List[str]) -> np.ndarray:
     panjang tetap 64 token, dan padding dinamis menghasilkan vektor yang berbeda.
     """
     inputs = _processor(text=texts, padding="max_length", return_tensors="pt")
-    with torch.no_grad():
+    with torch.inference_mode():
         feats = _model.get_text_features(**inputs)
     arr = feats.detach().cpu().numpy().astype("float32")
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
