@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+# CPU-only torch — image jauh lebih kecil dari build CUDA (~2.5GB vs ~7GB).
+# Index CPU di-set lewat --extra-index-url di Dockerfile.
+torch==2.5.1
+transformers==4.47.1
+pillow==11.1.0
+httpx==0.28.1
+numpy==2.2.1
+sentencepiece==0.2.0
+protobuf==5.29.2
